@@ -123,6 +123,29 @@ def _font(weight: str = "normal", size: int = 10) -> tuple:
     return (family, size, weight)
 
 
+def _normalize_value(text: str) -> str:
+    """Normalize a pasted/typed credential for storage.
+
+    * ``\\r\\n`` and bare ``\\r`` → ``\\n`` (LF-clean across platforms).
+    * Strip at most ONE trailing newline (matches env-file habits where the
+      file ends in a newline; PEM keys / JSON service-accounts keep their
+      interior structure untouched).
+
+    Interior newlines are preserved — that is the whole point of multiline
+    support. This is the single place store-side normalization happens, so the
+    ttk and CTk paths stay consistent.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if text.endswith("\n"):
+        text = text[:-1]
+    return text
+
+
+def _has_newline(text: str) -> bool:
+    """True if ``text`` contains a line break (after \\r\\n normalization)."""
+    return "\n" in text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _prefers_dark_mode() -> bool:
     """Best-effort OS dark-mode detection. Pure stdlib, never raises.
 
@@ -446,17 +469,81 @@ def _show_dialog_ttk(
 
     value_var = tk.StringVar()
     show_var = tk.BooleanVar(value=False)
+    multiline_var = tk.BooleanVar(value=False)
     persist_var = tk.BooleanVar(value=default_persist)
     vault_var = tk.BooleanVar(value=False)
 
+    colors = _DARK_COLORS if _prefers_dark_mode() else _LIGHT_COLORS
+
     # Input row: field + "Paste" button side by side. The button pulls the
     # value from the clipboard into the field — convenient, and the value still
-    # never touches the chat.
+    # never touches the chat. A masked single-line Entry is the default; a
+    # "Multiline" toggle swaps in an unmasked tk.Text for whole KEY=VALUE
+    # blocks (a Text widget can't honor ``show="*"`` so it is always unmasked).
     entry_row = ttk.Frame(outer)
     entry_row.pack(fill="x", pady=(4, 4))
     entry = ttk.Entry(entry_row, textvariable=value_var, show="*")
     entry.pack(side="left", fill="x", expand=True)
     entry.focus_set()
+
+    # Multiline widget — created up front but only packed when active. Styled
+    # manually with the active palette so it matches the themed Entry (the
+    # ``TEntry`` ttk style does not reach a raw tk.Text).
+    text_box = tk.Text(
+        entry_row,
+        height=6,
+        wrap="word",
+        undo=True,
+        font=_font("normal", 10),
+        bg=colors["entry_bg"],
+        fg=colors["entry_fg"],
+        insertbackground=colors["entry_fg"],
+        relief="flat",
+        borderwidth=1,
+        highlightthickness=1,
+        highlightbackground=colors["bg"] or "#888888",
+        highlightcolor=colors["backend"],
+    )
+
+    def _active_value() -> str:
+        if multiline_var.get():
+            return text_box.get("1.0", "end-1c")
+        return value_var.get()
+
+    def _set_value(text: str) -> None:
+        if multiline_var.get():
+            text_box.delete("1.0", "end")
+            text_box.insert("1.0", text)
+        else:
+            value_var.set(text)
+
+    def switch_to_multiline(keep_text: str | None = None):
+        """Show the Text widget, hide the Entry, carry the current value over."""
+        if not multiline_var.get():
+            multiline_var.set(True)
+        carry = keep_text if keep_text is not None else value_var.get()
+        entry.pack_forget()
+        text_box.pack(side="left", fill="both", expand=True)
+        text_box.delete("1.0", "end")
+        text_box.insert("1.0", carry)
+        toggle_show()  # disables "Show value" + sets hint
+        text_box.focus_set()
+
+    def switch_to_single():
+        carry = text_box.get("1.0", "end-1c")
+        multiline_var.set(False)
+        text_box.pack_forget()
+        entry.pack(side="left", fill="x", expand=True)
+        # Drop interior newlines when collapsing back to single-line.
+        value_var.set(carry.replace("\r\n", "\n").replace("\r", "").replace("\n", " ").strip())
+        toggle_show()
+        entry.focus_set()
+
+    def toggle_multiline():
+        if multiline_var.get():
+            switch_to_single()
+        else:
+            switch_to_multiline()
 
     def paste_clipboard():
         try:
@@ -464,9 +551,15 @@ def _show_dialog_ttk(
         except Exception:  # noqa: BLE001  — empty / non-text clipboard
             clip = ""
         if clip:
-            value_var.set(clip.strip("\r\n"))
-            entry.icursor("end")
-        entry.focus_set()
+            clip = clip.replace("\r\n", "\n").replace("\r", "\n")
+            # Auto-switch to multiline if the clipboard spans lines.
+            if "\n" in clip and not multiline_var.get():
+                switch_to_multiline(keep_text=clip)
+            else:
+                _set_value(clip)
+                if not multiline_var.get():
+                    entry.icursor("end")
+        (text_box if multiline_var.get() else entry).focus_set()
 
     ttk.Button(entry_row, text="Paste", width=8, command=paste_clipboard).pack(
         side="left", padx=(8, 0)
@@ -475,18 +568,43 @@ def _show_dialog_ttk(
     err_lbl = ttk.Label(outer, text="", foreground="#d23", style="Hint.TLabel")
     err_lbl.pack(anchor="w")
 
+    toggle_row = ttk.Frame(outer)
+    toggle_row.pack(anchor="w", fill="x")
+
+    show_chk = ttk.Checkbutton(
+        toggle_row, text="Show value", variable=show_var, command=lambda: toggle_show()
+    )
+    show_chk.pack(side="left")
+    ttk.Checkbutton(
+        toggle_row, text="Multiline", variable=multiline_var, command=toggle_multiline
+    ).pack(side="left", padx=(14, 0))
+
+    multi_hint = ttk.Label(toggle_row, text="", style="Muted.TLabel")
+    multi_hint.pack(side="left", padx=(10, 0))
+
     def toggle_show():
-        entry.configure(show="" if show_var.get() else "*")
+        if multiline_var.get():
+            # A tk.Text can't mask its content, so "Show value" is meaningless
+            # in multiline mode — disable it and show a hint.
+            try:
+                show_chk.state(["disabled"])
+            except Exception:  # noqa: BLE001
+                pass
+            multi_hint.configure(text="(multiline shown unmasked)")
+        else:
+            try:
+                show_chk.state(["!disabled"])
+            except Exception:  # noqa: BLE001
+                pass
+            multi_hint.configure(text="")
+            entry.configure(show="" if show_var.get() else "*")
 
     def clear_error(*_):
         if err_lbl.cget("text"):
             err_lbl.configure(text="")
 
     value_var.trace_add("write", clear_error)
-
-    ttk.Checkbutton(outer, text="Show value", variable=show_var, command=toggle_show).pack(
-        anchor="w"
-    )
+    text_box.bind("<KeyRelease>", clear_error)
 
     # Mirror-to-remote is only offered when the user has opted in
     # (remote_enabled) AND at least one supported vault CLI is detected on
@@ -525,12 +643,13 @@ def _show_dialog_ttk(
     result: dict = {"ok": False}
 
     def on_ok(event=None):
-        if not value_var.get():
+        raw = _active_value()
+        if not raw:
             err_lbl.configure(text="Please enter a value.")
-            entry.focus_set()
+            (text_box if multiline_var.get() else entry).focus_set()
             return
         result["ok"] = True
-        result["value"] = value_var.get()
+        result["value"] = _normalize_value(raw)
         result["vault"] = vault_var.get()
         result["persist"] = persist_var.get()
         _safe_destroy(root)
@@ -550,7 +669,17 @@ def _show_dialog_ttk(
         pass
     ok_btn.pack(side="right", padx=(0, 8))
 
-    root.bind("<Return>", on_ok)
+    def on_return(event=None):
+        # In multiline mode Enter must insert a newline in the Text widget, not
+        # submit. The Text's own class binding does the insert; we just don't
+        # submit (and Ctrl+Enter / the Save button remain the submit paths).
+        if multiline_var.get() and event is not None and event.widget is text_box:
+            return None
+        return on_ok(event)
+
+    root.bind("<Return>", on_return)
+    # Ctrl+Enter always submits, including from inside the multiline Text.
+    root.bind("<Control-Return>", on_ok)
     root.bind("<Escape>", on_cancel)
     root.protocol("WM_DELETE_WINDOW", on_cancel)
 
@@ -631,11 +760,15 @@ def _show_dialog_ctk(
 
     value_var = ctk.StringVar()
     show_var = ctk.BooleanVar(value=False)
+    multiline_var = ctk.BooleanVar(value=False)
     persist_var = ctk.BooleanVar(value=default_persist)
     vault_var = ctk.BooleanVar(value=False)
 
     # Input row: masked field + "Show value" toggle would crowd the row, so the
-    # toggle lives below. Field + "Paste" button sit side by side.
+    # toggle lives below. Field + "Paste" button sit side by side. A masked
+    # single-line CTkEntry is the default; a "Multiline" toggle swaps in an
+    # (always-unmasked) CTkTextbox for whole KEY=VALUE blocks — a Textbox can't
+    # honor ``show="*"``.
     entry_row = ctk.CTkFrame(outer, fg_color="transparent")
     entry_row.pack(fill="x")
     entry = ctk.CTkEntry(
@@ -652,15 +785,65 @@ def _show_dialog_ctk(
     entry.pack(side="left", fill="x", expand=True)
     entry.focus_set()
 
+    # Multiline widget — built up front, only packed when active.
+    text_box = ctk.CTkTextbox(
+        entry_row,
+        height=120,
+        font=f_body,
+        fg_color=BRAND["surface_alt"],
+        text_color=BRAND["text"],
+        border_color=BRAND["line"],
+        border_width=1,
+        wrap="word",
+    )
+
+    def _active_value() -> str:
+        if multiline_var.get():
+            return text_box.get("1.0", "end-1c")
+        return value_var.get()
+
+    def switch_to_multiline(keep_text: str | None = None):
+        if not multiline_var.get():
+            multiline_var.set(True)
+        carry = keep_text if keep_text is not None else value_var.get()
+        entry.pack_forget()
+        text_box.pack(side="left", fill="both", expand=True)
+        text_box.delete("1.0", "end")
+        text_box.insert("1.0", carry)
+        toggle_show()
+        text_box.focus_set()
+
+    def switch_to_single():
+        carry = text_box.get("1.0", "end-1c")
+        multiline_var.set(False)
+        text_box.pack_forget()
+        entry.pack(side="left", fill="x", expand=True)
+        value_var.set(carry.replace("\r\n", "\n").replace("\r", "").replace("\n", " ").strip())
+        toggle_show()
+        entry.focus_set()
+
+    def toggle_multiline():
+        if multiline_var.get():
+            switch_to_single()
+        else:
+            switch_to_multiline()
+
     def paste_clipboard():
         try:
             clip = root.clipboard_get()
         except Exception:  # noqa: BLE001  — empty / non-text clipboard
             clip = ""
         if clip:
-            value_var.set(clip.strip("\r\n"))
-            entry.icursor("end")
-        entry.focus_set()
+            clip = clip.replace("\r\n", "\n").replace("\r", "\n")
+            if "\n" in clip and not multiline_var.get():
+                switch_to_multiline(keep_text=clip)
+            elif multiline_var.get():
+                text_box.delete("1.0", "end")
+                text_box.insert("1.0", clip)
+            else:
+                value_var.set(clip)
+                entry.icursor("end")
+        (text_box if multiline_var.get() else entry).focus_set()
 
     ctk.CTkButton(
         entry_row,
@@ -679,26 +862,59 @@ def _show_dialog_ctk(
     err_lbl = ctk.CTkLabel(outer, text="", font=f_small, text_color="#f87171", anchor="w")
     err_lbl.pack(anchor="w", fill="x", pady=(4, 0))
 
+    toggle_row = ctk.CTkFrame(outer, fg_color="transparent")
+    toggle_row.pack(anchor="w", fill="x", pady=(6, 0))
+
+    show_chk = ctk.CTkCheckBox(
+        toggle_row,
+        text="Show value",
+        variable=show_var,
+        command=lambda: toggle_show(),
+        font=f_small,
+        text_color=BRAND["muted"],
+        fg_color=BRAND["violet"],
+        hover_color=BRAND["violet_light"],
+        border_color=BRAND["line"],
+    )
+    show_chk.pack(side="left")
+
+    ctk.CTkCheckBox(
+        toggle_row,
+        text="Multiline",
+        variable=multiline_var,
+        command=toggle_multiline,
+        font=f_small,
+        text_color=BRAND["muted"],
+        fg_color=BRAND["violet"],
+        hover_color=BRAND["violet_light"],
+        border_color=BRAND["line"],
+    ).pack(side="left", padx=(16, 0))
+
+    multi_hint = ctk.CTkLabel(toggle_row, text="", font=f_small, text_color=BRAND["muted"])
+    multi_hint.pack(side="left", padx=(10, 0))
+
     def toggle_show():
-        entry.configure(show="" if show_var.get() else "*")
+        if multiline_var.get():
+            # A Textbox can't mask its content — disable "Show value" + hint.
+            try:
+                show_chk.configure(state="disabled")
+            except Exception:  # noqa: BLE001
+                pass
+            multi_hint.configure(text="(multiline shown unmasked)")
+        else:
+            try:
+                show_chk.configure(state="normal")
+            except Exception:  # noqa: BLE001
+                pass
+            multi_hint.configure(text="")
+            entry.configure(show="" if show_var.get() else "*")
 
     def clear_error(*_):
         if err_lbl.cget("text"):
             err_lbl.configure(text="")
 
     value_var.trace_add("write", clear_error)
-
-    ctk.CTkCheckBox(
-        outer,
-        text="Show value",
-        variable=show_var,
-        command=toggle_show,
-        font=f_small,
-        text_color=BRAND["muted"],
-        fg_color=BRAND["violet"],
-        hover_color=BRAND["violet_light"],
-        border_color=BRAND["line"],
-    ).pack(anchor="w", pady=(6, 0))
+    text_box.bind("<KeyRelease>", clear_error)
 
     # Mirror-to-remote is only offered when the user has opted in
     # (remote_enabled) AND at least one supported vault CLI is detected on PATH.
@@ -752,12 +968,13 @@ def _show_dialog_ctk(
     result: dict = {"ok": False}
 
     def on_ok(event=None):
-        if not value_var.get():
+        raw = _active_value()
+        if not raw:
             err_lbl.configure(text="Please enter a value.")
-            entry.focus_set()
+            (text_box if multiline_var.get() else entry).focus_set()
             return
         result["ok"] = True
-        result["value"] = value_var.get()
+        result["value"] = _normalize_value(raw)
         result["vault"] = vault_var.get()
         result["persist"] = persist_var.get()
         _safe_destroy(root)
@@ -798,7 +1015,15 @@ def _show_dialog_ctk(
         text_color="#ffffff",
     ).pack(side="right", padx=(0, 10))
 
-    root.bind("<Return>", on_ok)
+    def on_return(event=None):
+        # In multiline mode Enter inserts a newline in the Textbox; the Save
+        # button or Ctrl+Enter submit. Single-line Enter still submits.
+        if multiline_var.get():
+            return None
+        return on_ok(event)
+
+    root.bind("<Return>", on_return)
+    root.bind("<Control-Return>", on_ok)
     root.bind("<Escape>", on_cancel)
     root.protocol("WM_DELETE_WINDOW", on_cancel)
 

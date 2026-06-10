@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Multiline paste support** in both GUI paths (CustomTkinter + ttk fallback).
+  The masked single-line field stays the default; a new **"Multiline"** toggle
+  swaps in an (unmasked) text box for pasting a whole `KEY=VALUE` env block,
+  PEM key, or JSON service-account as **one** secret. Pasting a value that
+  contains a newline auto-switches to multiline. `\r\n` is normalized to `\n`
+  and at most one trailing newline is stripped on save.
+
+### Fixed
+
+- `secret-get <NAME> --export-env` (POSIX shell) no longer truncates a
+  multiline value to its first line: the snippet now reads the whole temp file
+  (`NAME="$(cat …)"`) instead of `IFS= read -r NAME < …`. The value is still
+  read from the temp file at eval time, never placed on the command line.
+
 ## [1.1.0] — 2026-05-29
 
 ### Changed

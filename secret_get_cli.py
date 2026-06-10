@@ -125,10 +125,17 @@ def _emit_export(env_name: str, tmp_path, shell: str) -> str:
             f"Write-Host 'OK: $env:{env_name} set from {path_q}'"
         )
     path_q = shlex.quote(path_str)
+    # Read the WHOLE file, not just the first line: ``IFS= read -r`` stops at
+    # the first newline and would truncate a multiline value (PEM key, JSON
+    # service-account, multi-line env block) to its first line. ``$(cat …)``
+    # reads the entire file; command substitution strips trailing newlines,
+    # which matches the single-trailing-\n behavior on the paste side. The
+    # value is still read from the temp file at eval time — never on the
+    # command line.
     return (
         f"# File TTL: {cc.TMP_TTL_MINUTES} min. "
         "Run in a non-traced shell to avoid leaks.\n"
-        f"IFS= read -r {env_name} < {path_q}\n"
+        f"{env_name}=\"$(cat {path_q})\"\n"
         f"export {env_name}\n"
         f'echo "OK: \\${env_name} set from {path_q}"'
     )
